@@ -327,6 +327,12 @@ class ObjectController(Controller):
 
         partition, nodes = self.app.object_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
+        if self.app.wan_mode:
+            other_proxy = self.get_other_region_proxy(self.app.own_zone, 
+                                                      self.app.near_distance,
+                                                      nodes)
+            if len(other_proxy) > 0:
+                return self.request_relay(req, other_proxy)
         shuffle(nodes)
         resp = self.GETorHEAD_base(
             req, _('Object'), partition,
@@ -585,8 +591,13 @@ class ObjectController(Controller):
                     self.app.expiring_objects_account, delete_at_container)
         else:
             delete_at_part = delete_at_nodes = None
-        partition, nodes = self.app.object_ring.get_nodes(
-            self.account_name, self.container_name, self.object_name)
+        if self.app.wan_mode:
+            partition, nodes = self.app.object_ring.get_near_nodes(
+                self.account_name, self.container_name, self.object_name,
+                self.app.own_zone, self.app.near_distance)
+        else:
+            partition, nodes = self.app.object_ring.get_nodes(
+                self.account_name, self.container_name, self.object_name)
         # do a HEAD request for container sync and checking object versions
         if 'x-timestamp' in req.headers or \
                 (object_versions and not
@@ -911,6 +922,12 @@ class ObjectController(Controller):
             return HTTPNotFound(request=req)
         partition, nodes = self.app.object_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
+        if self.app.wan_mode:
+            other_proxy = self.get_other_region_proxy(self.app.own_zone, 
+                                                      self.app.near_distance,
+                                                      nodes)
+            if len(other_proxy) > 0:
+                return self.request_relay(req, other_proxy)
         # Used by container sync feature
         if 'x-timestamp' in req.headers:
             try:
@@ -930,9 +947,19 @@ class ObjectController(Controller):
             nheaders['X-Container-Host'] = '%(ip)s:%(port)s' % container
             nheaders['X-Container-Partition'] = container_partition
             nheaders['X-Container-Device'] = container['device']
+            if self.app.wan_mode:
+                if not nheaders.has_key('X-Force-Local-Region'):
+                    nheaders['X-Force-Local-Region'] = self.app.own_zone
             headers.append(nheaders)
-        resp = self.make_requests(req, self.app.object_ring,
-                                  partition, 'DELETE', req.path_info, headers)
+        if self.app.wan_mode:
+            resp = self.make_requests_regions(req, self.app.object_ring,
+                                              partition, 'DELETE', 
+                                              req.path_info, headers,
+                                              local_region=self.app.own_zone,
+                                              near_distance=self.app.near_distance)
+        else:
+            resp = self.make_requests(req, self.app.object_ring,
+                                      partition, 'DELETE', req.path_info, headers)
         return resp
 
     @public

@@ -33,7 +33,7 @@ from eventlet.queue import Queue, Empty, Full
 from eventlet.timeout import Timeout
 
 from swift.common.utils import normalize_timestamp, config_true_value, public
-from swift.common.bufferedhttp import http_connect
+from swift.common.bufferedhttp import http_connect, http_connect_raw
 from swift.common.constraints import MAX_ACCOUNT_NAME_LENGTH
 from swift.common.exceptions import ChunkReadTimeout, ConnectionTimeout
 from swift.common.http import is_informational, is_success, is_redirection, \
@@ -41,6 +41,8 @@ from swift.common.http import is_informational, is_success, is_redirection, \
     HTTP_BAD_REQUEST, HTTP_NOT_FOUND, HTTP_SERVICE_UNAVAILABLE, \
     HTTP_INSUFFICIENT_STORAGE, HTTP_UNAUTHORIZED
 from swift.common.swob import Request, Response, status_map
+import cPickle as pickle
+from random import shuffle
 
 
 def update_headers(response, headers):
@@ -740,3 +742,153 @@ class Controller(object):
     @public
     def OPTIONS(self, req):
         return self.OPTIONS_base(req)
+
+    def _request_relay(self, req, host, port):
+        try:
+            with ConnectionTimeout(self.app.conn_timeout):
+                conn = http_connect_raw(host, port, req.method, req.path, 
+                                        headers=req.headers, 
+                                        query_string=req.query_string,
+                                        ssl=True if req.environ['wsgi.url_scheme'] == 'https' else False)
+                with Timeout(self.app.conn_timeout):
+                    result = conn.getresponse()
+        except (Exception, Timeout), err:
+            return Response(status=HTTP_GATEWAY_TIMEOUT, request=req)
+
+        resp = Response(status=result.status, request=req)
+        resp.bytes_transferred = 0
+        
+        def response_iter():
+            try:
+                while True:
+                    with ChunkReadTimeout(self.app.client_timeout):
+                        chunk = result.read(self.app.client_chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+                    resp.bytes_transferred += len(chunk)
+            except GeneratorExit:
+                pass
+            except (Exception, Timeout):
+                raise
+
+        resp.headerlist = result.getheaders()
+        resp.content_length = result.getheader('Content-Length')
+        if resp.content_length < 4096:
+            resp.body = result.read()
+        else:
+            resp.app_iter = response_iter()
+            update_headers(resp, {'accept-ranges': 'bytes'})
+            resp.content_length = result.getheader('Content-Length')
+        update_headers(resp, result.getheaders())
+        if req.method == 'HEAD':
+            update_headers(resp, {'Content-Length': 
+                                  result.getheader('Content-Length')})
+        return resp
+
+    def request_relay(self, req, proxy_servers):
+        """
+        This method relay a request to other proxy server.
+        proxy_servers = ((host, port), (host, port))
+        """
+        for host, port in proxy_servers:
+            resp = self._request_relay(req, host, port)
+            if is_success(resp.status):
+                return resp
+        return resp
+
+    def get_other_region_proxy(self, own_zone, near_distance, nodes):
+        """
+        proxy_servers = {zone: (hostname, port)}
+        
+        """
+        try:
+            with open('/etc/swift/proxy_servers.pkl') as f:
+                proxy_servers = pickle.load(f)
+        except (Exception, IOError), err:
+            pass
+
+        other_proxy_servers = set()
+
+        def isnearby(one, other, distance):
+            radius = distance / 2
+            mini = one - radius
+            maxi = one + radius
+            if mini <= other and maxi >= other:
+                return True
+            return False
+
+        for node in nodes:
+            if isnearby(own_zone, node['zone'], near_distance):
+                return set()
+            for psrv in proxy_servers.keys():
+                if isnearby(psrv, node['zone'], near_distance):
+                    other_proxy_servers.add(proxy_servers[psrv])
+        shuffle(other_proxy_servers)
+        return other_proxy_servers
+
+    def get_region_proxy(self, zone, near_distance):
+        try:
+            with open('/etc/swift/proxy_servers.pkl') as f:
+                proxy_servers = pickle.load(f)
+        except (Exception, IOError), err:
+            pass
+        for pz in proxy_servers.keys():
+            if self.isnearby(zone, pz, near_distance):
+                return proxy_servers[pz]
+        return None, None
+
+    def isnearby(self, one, other, distance):
+        radius = distance / 2
+        mini = one - radius
+        maxi = one + radius
+        if mini <= other and maxi >= other:
+            return True
+        return False
+
+    def _make_request_relay(self, req, host, port):
+        try:
+            with ConnectionTimeout(self.app.conn_timeout):
+                conn = http_connect_raw(host, port, req.method, req.path, 
+                                        headers=req.headers, 
+                                        query_string=req.query_string,
+                                        ssl=True if req.environ['wsgi.url_scheme'] == 'https' else False)
+                with Timeout(self.app.conn_timeout):
+                    resp = conn.getresponse()
+        except (Exception, Timeout), err:
+            return HTTP_GATEWAY_TIMEOUT, '', ''
+        if not is_informational(resp.status) and \
+                not is_server_error(resp.status):
+            return resp.status, resp.reason, resp.read()
+
+    def make_requests_regions(self, req, ring, part, method, path, headers,
+                              query_string='', local_region=False,
+                              near_distance=False):
+        """
+        """
+        start_nodes = ring.get_part_nodes(part)
+        pile = GreenPile(len(start_nodes))
+        local_nodes = [node for node in start_nodes \
+                           if self.isnearby(local_region, node['zone'], near_distance)]
+        other_proxy = set()
+        request_count = len(start_nodes)
+        for node, head in zip(start_nodes, headers):
+            if self.isnearby(local_region, node['zone'], near_distance):
+                pile.spawn(self._make_request, iter(local_nodes), part, method, path,
+                           head, query_string, self.app.logger.thread_locals)
+            else:
+                if head['X-Force-Local-Region'] == local_region:
+                    host, port = self.get_region_proxy(node['zone'], near_distance)
+                    hp = host + ':' + port
+                    if hp not in other_proxy:
+                        req.headers['X-Force-Local-Region'] = local_region
+                        pile.spawn(self._make_request_relay, req, host, port)
+                        other_proxy.add(hp)
+                    else:
+                        request_count -= 1
+        response = [resp for resp in pile if resp]
+        while len(response) < request_count:
+            response.append((HTTP_SERVICE_UNAVAILABLE, '', ''))
+        statuses, reasons, bodies = zip(*response)
+        return self.best_response(req, statuses, reasons, bodies,
+                                  '%s %s' % (self.server_type, req.method))

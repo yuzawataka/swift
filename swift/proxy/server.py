@@ -110,6 +110,10 @@ class Application(object):
             a.strip()
             for a in conf.get('cors_allow_origin', '').split(',')
             if a.strip()]
+        self.wan_mode = config_true_value(conf.get('wan_mode', 'false'))
+        self.own_zone = int(conf.get('own_zone'))
+        self.near_distance = int(conf.get('near_distance', 100))
+
 
     def get_controller(self, path):
         """
