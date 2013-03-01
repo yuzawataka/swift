@@ -286,10 +286,18 @@ class ObjectController(Controller):
                 return aresp
         partition, nodes = self.app.object_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
-        shuffle(nodes)
+        if self.app.wan_mode:
+            partition, near_nodes = self.app.object_ring.get_near_nodes(
+                self.account_name, self.container_name, self.object_name,
+                self.app.own_zone, self.app.near_distance)
+            nodes = near_nodes + nodes
+            attemps = len(self.app.object_ring.devs)
+        else:
+            shuffle(nodes)
+            attemps = len(nodes)
         resp = self.GETorHEAD_base(req, _('Object'), partition,
                 self.iter_nodes(partition, nodes, self.app.object_ring),
-                req.path_info, len(nodes))
+                req.path_info, attemps)
         # Whether we get a 416 Requested Range Not Satisfiable or not,
         # we should request a manifest because size of manifest file
         # can be not 0. After checking a manifest, redo the range request
@@ -416,6 +424,12 @@ class ObjectController(Controller):
             container_partition, containers, _junk, req.acl, _junk, _junk = \
                 self.container_info(self.account_name, self.container_name,
                     account_autocreate=self.app.account_autocreate)
+            if self.app.wan_mode:
+                partition, near_nodes = self.app.object_ring.get_near_nodes(
+                    self.account_name, self.container_name, self.object_name,
+                    self.app.own_zone, self.app.near_distance)
+                containers = near_nodes + \
+                    [cont for cont in containers if cont['zone'] not in [c['zone'] for c in near_nodes]]
             if 'swift.authorize' in req.environ:
                 aresp = req.environ['swift.authorize'](req)
                 if aresp:
@@ -456,8 +470,9 @@ class ObjectController(Controller):
                     nheaders['X-Delete-At-Partition'] = delete_at_part
                     nheaders['X-Delete-At-Device'] = node['device']
                 headers.append(nheaders)
+            node_ls = containers if self.app.wan_mode else None
             resp = self.make_requests(req, self.app.object_ring, partition,
-                                      'POST', req.path_info, headers)
+                                      'POST', req.path_info, headers, node_list=node_ls)
             return resp
 
     def _send_file(self, conn, path):
@@ -533,8 +548,13 @@ class ObjectController(Controller):
                     self.app.expiring_objects_account, delete_at_container)
         else:
             delete_at_part = delete_at_nodes = None
-        partition, nodes = self.app.object_ring.get_nodes(
-            self.account_name, self.container_name, self.object_name)
+        if self.app.wan_mode:
+            partition, nodes = self.app.object_ring.get_near_nodes(
+                self.account_name, self.container_name, self.object_name,
+                self.app.own_zone, self.app.near_distance)
+        else:
+            partition, nodes = self.app.object_ring.get_nodes(
+                self.account_name, self.container_name, self.object_name)
         # do a HEAD request for container sync and checking object versions
         if 'x-timestamp' in req.headers or (object_versions and not
                                     req.environ.get('swift_versioned_copy')):
@@ -779,6 +799,12 @@ class ObjectController(Controller):
         (container_partition, containers, _junk, req.acl,
          req.environ['swift_sync_key'], object_versions) = \
             self.container_info(self.account_name, self.container_name)
+        if self.app.wan_mode:
+            partition, near_nodes = self.app.object_ring.get_near_nodes(
+                self.account_name, self.container_name, self.object_name,
+                self.app.own_zone, self.app.near_distance)
+            containers = near_nodes + \
+                [cont for cont in containers if cont['zone'] not in [c['zone'] for c in near_nodes]]
         if object_versions:
             # this is a version manifest and needs to be handled differently
             lcontainer = object_versions.split('/')[0]
@@ -856,8 +882,9 @@ class ObjectController(Controller):
             nheaders['X-Container-Partition'] = container_partition
             nheaders['X-Container-Device'] = container['device']
             headers.append(nheaders)
+        node_ls = containers if self.app.wan_mode else None
         resp = self.make_requests(req, self.app.object_ring,
-                partition, 'DELETE', req.path_info, headers)
+                partition, 'DELETE', req.path_info, headers, node_list=node_ls)
         return resp
 
     @public

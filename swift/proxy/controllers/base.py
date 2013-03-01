@@ -397,7 +397,7 @@ class Controller(object):
                     {'method': method, 'path': path})
 
     def make_requests(self, req, ring, part, method, path, headers,
-                    query_string=''):
+                    query_string='', node_list=None):
         """
         Sends an HTTP request to multiple nodes and aggregates the results.
         It attempts the primary nodes concurrently, then iterates over the
@@ -405,10 +405,16 @@ class Controller(object):
 
         :param headers: a list of dicts, where each dict represents one
                         backend request that should be made.
+        :param node_list: a list of node dicts, using in WAN mode. 
+                          default None. 
         :returns: a webob Response object
         """
-        start_nodes = ring.get_part_nodes(part)
-        nodes = self.iter_nodes(part, start_nodes, ring)
+        if node_list:
+            start_nodes = node_list
+            nodes = iter(node_list)
+        else:
+            start_nodes = ring.get_part_nodes(part)
+            nodes = self.iter_nodes(part, ring.get_part_nodes(part), ring)
         pile = GreenPile(len(start_nodes))
         for head in headers:
             pile.spawn(self._make_request, nodes, part, method, path,

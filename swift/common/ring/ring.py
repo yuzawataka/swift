@@ -266,3 +266,37 @@ class Ring(object):
                     yield dev
                     used_tiers.update(tiers_for_dev(dev))
                     break
+
+    def get_near_nodes(self, account, container, obj, own_zone, near_distance):
+        """
+        Get the partition and nodes same as get_nodes, 
+
+        :param account: account name
+        :param container: container name
+        :param obj: object name
+        :param own_zone: zone number of proxy-server location.
+        :param near_distance: specify the range of the number 
+                              for which centered on the own_zone number.
+        :returns: a tuple of (partition, list of node dicts)
+        """
+        part, nodes = self.get_nodes(account, container, obj)
+
+        def isnearby(one, other, distance):
+            radius = distance / 2
+            mini = one - radius
+            maxi = one + radius
+            if mini <= other and maxi >= other:
+                return True
+            return False
+
+        near_nodes = []
+        for node in nodes:
+            if isnearby(own_zone, node['zone'], near_distance):
+                near_nodes.append(node)
+        if len(near_nodes) <= self.replica_count:
+            for node in self.get_more_nodes(part):
+                if isnearby(own_zone, node['zone'], near_distance):
+                    near_nodes.append(node)
+                if len(near_nodes) >= self.replica_count:
+                    break
+        return part, near_nodes

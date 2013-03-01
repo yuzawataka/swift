@@ -104,6 +104,9 @@ class Application(object):
             int(conf.get('rate_limit_segments_per_sec', 1))
         self.log_handoffs = \
             conf.get('log_handoffs', 'true').lower() in TRUE_VALUES
+        self.wan_mode = conf.get('wan_mode', 'false').lower() in TRUE_VALUES
+        self.own_zone = int(conf.get('own_zone'))
+        self.near_distance = int(conf.get('near_distance', 100))
 
     def get_controller(self, path):
         """
