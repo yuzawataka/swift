@@ -552,6 +552,11 @@ class ObjectController(Controller):
             partition, nodes = self.app.object_ring.get_near_nodes(
                 self.account_name, self.container_name, self.object_name,
                 self.app.own_zone, self.app.near_distance)
+            if len(nodes) < self.app.object_ring.replica_count:
+                partition, pnodes = self.app.object_ring.get_nodes(
+                    self.account_name, self.container_name, self.object_name)
+                nodes = nodes + pnodes[:(self.app.object_ring.replica_count
+                                         - len(nodes))]
         else:
             partition, nodes = self.app.object_ring.get_nodes(
                 self.account_name, self.container_name, self.object_name)
