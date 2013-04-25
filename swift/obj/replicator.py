@@ -38,6 +38,7 @@ from swift.common.bufferedhttp import http_connect
 from swift.common.daemon import Daemon
 from swift.common.http import HTTP_OK, HTTP_INSUFFICIENT_STORAGE
 from swift.common.exceptions import PathNotDir
+from swift.obj.watcher import ObjectWatcher
 
 hubs.use_hub(get_hub())
 
@@ -267,6 +268,10 @@ class ObjectReplicator(Daemon):
         self.recon_cache_path = conf.get('recon_cache_path',
                                          '/var/cache/swift')
         self.rcache = os.path.join(self.recon_cache_path, "object.recon")
+        self.watcher = config_true_value(conf.get('watcher', 'yes'))
+        self.full_check_omit_times = int(conf.get('full_check_omit_times', 100))
+        self.full_check_omit = self.full_check_omit_times
+        self.watchers = {}
 
     def _rsync(self, args):
         """
@@ -550,6 +555,12 @@ class ObjectReplicator(Daemon):
         """
         Returns a sorted list of jobs (dictionaries) that specify the
         partitions, nodes, etc to be rsynced.
+        When 'watcher' enabled, picking only partitions which modified
+        or created new. But full partition scanning is executed when
+        replicator is just started. And also 100 times every full scanning
+        runs. 100 is the default value of 'full_check_omit_times'.
+        That's in order to execute removing files over 'reclaim_age'
+        in hash_suffix().
         """
         jobs = []
         ips = whataremyips()
@@ -569,7 +580,13 @@ class ObjectReplicator(Daemon):
                 except Exception:
                     self.logger.exception('ERROR creating %s' % obj_path)
                 continue
-            for partition in os.listdir(obj_path):
+            if self.watcher and self.full_check_omit < self.full_check_omit_times:
+                partitions = self.watchers[local_dev.get('device')]()
+            else:
+                partitions = os.listdir(obj_path)
+            for p in partitions:
+                self.logger.debug('Partition: %s' % p)
+            for partition in partitions:
                 try:
                     job_path = join(obj_path, partition)
                     if isfile(job_path):
@@ -656,12 +673,27 @@ class ObjectReplicator(Daemon):
 
     def run_forever(self, *args, **kwargs):
         self.logger.info(_("Starting object replicator in daemon mode."))
+        # Starting watcher with new process.
+        if self.watcher:
+            ips = whataremyips()
+            for local_dev in [dev for dev in self.object_ring.devs
+                              if dev and dev['ip'] in ips and
+                              dev['port'] == self.port]:
+                dev_path = join(self.devices_dir, local_dev['device'])
+                obj_path = join(dev_path, 'objects')
+                self.watchers[local_dev.get('device')] = \
+                    ObjectWatcher(obj_path, logger=self.logger)
+                self.logger.info(_('Starting watchers: %s.'), obj_path)
         # Run the replicator continually
         while True:
             start = time.time()
             self.logger.info(_("Starting object replication pass."))
             # Run the replicator
             self.replicate()
+            if self.full_check_omit == self.full_check_omit_times:
+                self.full_check_omit = 0
+            else:
+                self.full_check_omit += 1
             total = (time.time() - start) / 60
             self.logger.info(
                 _("Object replication complete. (%.02f minutes)"), total)
